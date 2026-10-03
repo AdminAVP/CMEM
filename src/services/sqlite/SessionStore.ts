@@ -1,3 +1,4 @@
+import { emitContextInvalidation } from '../../shared/context-invalidation.js';
 import { Database, type SQLQueryBindings, type Statement } from 'bun:sqlite';
 import { randomUUID } from 'crypto';
 import { DATA_DIR, DB_PATH, ensureDir, OBSERVER_SESSIONS_PROJECT, USER_SETTINGS_PATH } from '../../shared/paths.js';
@@ -2987,7 +2988,9 @@ export class SessionStore {
   }
 
   appendWorkStateEntry(entry: { project: string; listName: string; fields: WorkStateFields; createdAtEpoch?: number }): number {
-    return appendWorkStateEntryRow(this.db, entry);
+    const entryId = appendWorkStateEntryRow(this.db, entry);
+    emitContextInvalidation({ projects: [entry.project] }, 'appendWorkStateEntry');
+    return entryId;
   }
 
   getWorkStateEntries(projects: string[], listName?: string): WorkStateEntry[] {
@@ -3291,18 +3294,30 @@ export class SessionStore {
     return stmt.all(...memorySessionIds) as any[];
   }
 
-  getPromptNumberFromUserPrompts(contentSessionId: string, sessionDbId?: number): number {
+  /**
+   * The session's current prompt number (count of its user_prompts rows).
+   * `createdAtOrBeforeEpochMs` answers "which prompt was current at that
+   * moment" instead — for an event that happened earlier than it is being
+   * ingested (a hook spool entry drained after an outage).
+   */
+  getPromptNumberFromUserPrompts(
+    contentSessionId: string,
+    sessionDbId?: number,
+    createdAtOrBeforeEpochMs?: number,
+  ): number {
     const resolvedSessionDbId = this.resolvePromptSessionDbId(contentSessionId, sessionDbId);
-    if (resolvedSessionDbId !== null) {
+    const sessionClause = resolvedSessionDbId !== null ? 'session_db_id = ?' : 'content_session_id = ?';
+    const sessionParam = resolvedSessionDbId !== null ? resolvedSessionDbId : contentSessionId;
+    if (createdAtOrBeforeEpochMs !== undefined) {
       const result = this.db.prepare(`
-        SELECT COUNT(*) as count FROM user_prompts WHERE session_db_id = ?
-      `).get(resolvedSessionDbId) as { count: number };
+        SELECT COUNT(*) as count FROM user_prompts WHERE ${sessionClause} AND created_at_epoch <= ?
+      `).get(sessionParam, createdAtOrBeforeEpochMs) as { count: number };
       return result.count;
     }
 
     const result = this.db.prepare(`
-      SELECT COUNT(*) as count FROM user_prompts WHERE content_session_id = ?
-    `).get(contentSessionId) as { count: number };
+      SELECT COUNT(*) as count FROM user_prompts WHERE ${sessionClause}
+    `).get(sessionParam) as { count: number };
     return result.count;
   }
 
@@ -3640,6 +3655,7 @@ export class SessionStore {
       timestampIso,
       timestampEpoch
     );
+    emitContextInvalidation({ projects: [project] }, 'storeSummary');
 
     return {
       id: Number(result.lastInsertRowid),
@@ -3842,7 +3858,9 @@ export class SessionStore {
       return { observationIds, mergedIntoExisting, insertedObservationIds, summaryId, createdAtEpoch: timestampEpoch };
     });
 
-    return storeTx();
+    const stored = storeTx();
+    emitContextInvalidation({ projects: [project] }, 'storeObservations');
+    return stored;
   }
 
   /**
@@ -4312,6 +4330,7 @@ export class SessionStore {
       summary.created_at,
       summary.created_at_epoch
     );
+    emitContextInvalidation({ projects: [summary.project] }, 'importSessionSummary');
 
     return { imported: true, id: result.lastInsertRowid as number };
   }
@@ -4386,6 +4405,7 @@ export class SessionStore {
       obs.created_at,
       obs.created_at_epoch
     );
+    emitContextInvalidation({ projects: [obs.project] }, 'importObservation');
 
     return { imported: true, id: result.lastInsertRowid as number };
   }
